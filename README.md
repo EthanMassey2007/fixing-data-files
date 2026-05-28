@@ -1,4 +1,7 @@
 Dataset README
+Download bra-rainfall-subnat-full.csv here:
+https://data.humdata.org/dataset/bra-rainfall-subnational/resource/373e773f-58e3-487e-b219-f566ece64d5e
+
 Overview
 
 This folder contains a collection of raw data files along with a cleaned and consolidated dataset:

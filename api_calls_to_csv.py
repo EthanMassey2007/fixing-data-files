@@ -14,14 +14,45 @@ rainfall_file = os.path.join(data_dir, "rainfall.csv")
 population_file = os.path.join(data_dir, "population.csv")
 idhm_file = os.path.join(data_dir, "idhm.csv")
 
-TARGET_YEAR = 2018
-TARGET_WEEKS = list(range(30, 38))
+rainfall_source_file = os.path.join(data_dir, "bra-rainfall-subnat-full.csv")
+pcode_file = os.path.join(data_dir, "global_pcodes.csv")
+
+TARGET_RANGES = [
+    (2018, list(range(30, 38))),
+    (2025, list(range(43, 53))),
+]
+
+name_corrections = {
+    "Parati": "Paraty",
+    "Niteroi": "Niterói",
+    "Sao Goncalo": "São Gonçalo",
+    "Nova Iguacu": "Nova Iguaçu",
+    "Mesquita": "Mesquita",
+    "Rio de Janeiro": "Rio de Janeiro",
+    "Trajano de Morais": "Trajano de Moraes",
+    "Areal": "Areal",
+}
 
 
 def normalize_name(name):
     if not isinstance(name, str):
         return ""
-    return unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("ASCII").lower().strip()
+    return (
+        unicodedata.normalize("NFKD", name)
+        .encode("ASCII", "ignore")
+        .decode("ASCII")
+        .lower()
+        .strip()
+    )
+
+
+def is_target_row(df):
+    mask = pd.Series(False, index=df.index)
+
+    for year, weeks in TARGET_RANGES:
+        mask |= (df["year"] == year) & (df["week"].isin(weeks))
+
+    return mask
 
 
 def fetch_dengue_row(municipio, week, year):
@@ -66,7 +97,7 @@ def fetch_dengue_row(municipio, week, year):
         }
 
     except Exception as e:
-        print(f"Failed: {name}, {year} week {week}: {e}")
+        print(f"Failed API fetch: {name}, {year} week {week}: {e}")
         return None
 
 
@@ -87,8 +118,7 @@ def replace_rows(csv_file, value_column, new_rows):
         ]
     )
 
-    bad_mask = (df["year"] == TARGET_YEAR) & (df["week"].isin(TARGET_WEEKS))
-    df = df[~bad_mask].copy()
+    df = df[~is_target_row(df)].copy()
 
     df = pd.concat([df, replacement], ignore_index=True)
     df = df.sort_values(["municipio", "year", "week"]).reset_index(drop=True)
@@ -105,34 +135,121 @@ def repair_static_file(csv_file, value_column):
     fixed_rows = []
 
     for municipio in sorted(df["municipio"].unique()):
-        good_rows = df[
-            (df["municipio"] == municipio)
-            & ~((df["year"] == TARGET_YEAR) & (df["week"].isin(TARGET_WEEKS)))
-        ]
+        for year, weeks in TARGET_RANGES:
+            good_rows = df[
+                (df["municipio"] == municipio)
+                & ~((df["year"] == year) & (df["week"].isin(weeks)))
+            ]
 
-        if good_rows.empty:
-            continue
+            if good_rows.empty:
+                continue
 
-        value = good_rows[value_column].dropna().iloc[0]
+            value = good_rows[value_column].dropna().iloc[-1]
 
-        for week in TARGET_WEEKS:
-            fixed_rows.append(
-                {
-                    "municipio": municipio,
-                    "year": TARGET_YEAR,
-                    "week": week,
-                    value_column: value,
-                }
-            )
+            for week in weeks:
+                fixed_rows.append(
+                    {
+                        "municipio": municipio,
+                        "year": year,
+                        "week": week,
+                        value_column: value,
+                    }
+                )
 
-    bad_mask = (df["year"] == TARGET_YEAR) & (df["week"].isin(TARGET_WEEKS))
-    df = df[~bad_mask].copy()
+    df = df[~is_target_row(df)].copy()
 
     df = pd.concat([df, pd.DataFrame(fixed_rows)], ignore_index=True)
     df = df.sort_values(["municipio", "year", "week"]).reset_index(drop=True)
 
     df.to_csv(csv_file, index=False)
     print(f"Updated {csv_file}")
+
+
+def load_rainfall_sources():
+    rainfall_df = pd.read_csv(rainfall_source_file)
+    pcode_df = pd.read_csv(pcode_file, low_memory=False)
+
+    rainfall_df.columns = [c.strip() for c in rainfall_df.columns]
+    pcode_df.columns = [c.strip() for c in pcode_df.columns]
+
+    required_rainfall_cols = {"PCODE", "date", "rfh_avg"}
+    required_pcode_cols = {"Parent P-Code", "P-Code", "Name"}
+
+    missing_rainfall = required_rainfall_cols - set(rainfall_df.columns)
+    missing_pcode = required_pcode_cols - set(pcode_df.columns)
+
+    if missing_rainfall:
+        raise ValueError(f"Rainfall source missing columns: {missing_rainfall}")
+
+    if missing_pcode:
+        raise ValueError(f"P-code file missing columns: {missing_pcode}")
+
+    municipalities_df = pcode_df[pcode_df["Parent P-Code"] == "BR33"][
+        ["P-Code", "Name"]
+    ].copy()
+
+    municipalities_df.rename(
+        columns={
+            "Name": "MUNICIPIO",
+            "P-Code": "PCODE",
+        },
+        inplace=True,
+    )
+
+    rainfall_df["DATE"] = pd.to_datetime(rainfall_df["date"], errors="coerce")
+    rainfall_df["PRECIP"] = (
+        pd.to_numeric(rainfall_df["rfh_avg"], errors="coerce").fillna(0) / 10.0
+    )
+    rainfall_df = rainfall_df.dropna(subset=["DATE"])
+
+    return rainfall_df, municipalities_df
+
+
+def weekly_rainfall(year, week, rainfall_df, municipalities_df):
+    week_sum = {}
+
+    for _, row in municipalities_df.iterrows():
+        muni_raw = row["MUNICIPIO"]
+        muni_corrected = name_corrections.get(muni_raw, muni_raw)
+        muni_name = normalize_name(muni_corrected)
+
+        muni_rain = rainfall_df[rainfall_df["PCODE"] == row["PCODE"]].copy()
+
+        week_precip = 0.0
+
+        for _, r in muni_rain.iterrows():
+            for day_offset in range(10):
+                day = r["DATE"] + pd.Timedelta(days=day_offset)
+
+                if day.year == year and day.isocalendar()[1] == week:
+                    week_precip += r["PRECIP"]
+
+        week_sum[muni_name] = week_precip
+
+    return week_sum
+
+
+def build_rainfall_rows():
+    rainfall_df, municipalities_df = load_rainfall_sources()
+
+    rows = []
+
+    for year, weeks in TARGET_RANGES:
+        for week in weeks:
+            print(f"Computing rainfall for {year} week {week}...")
+            rain_dict = weekly_rainfall(year, week, rainfall_df, municipalities_df)
+
+            for municipio, rainfall in rain_dict.items():
+                rows.append(
+                    {
+                        "municipio": municipio,
+                        "year": year,
+                        "week": week,
+                        "rainfall": rainfall,
+                    }
+                )
+
+    return rows
 
 
 def main():
@@ -152,10 +269,12 @@ def main():
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
 
-        for year in [TARGET_YEAR]:
-            for week in TARGET_WEEKS:
+        for year, weeks in TARGET_RANGES:
+            for week in weeks:
                 for municipio in municipalities_info:
-                    futures.append(executor.submit(fetch_dengue_row, municipio, week, year))
+                    futures.append(
+                        executor.submit(fetch_dengue_row, municipio, week, year)
+                    )
 
         for future in as_completed(futures):
             result = future.result()
@@ -166,10 +285,13 @@ def main():
     replace_rows(temperature_file, "temperature", new_rows)
     replace_rows(humidity_file, "humidity", new_rows)
 
+    rainfall_rows = build_rainfall_rows()
+    replace_rows(rainfall_file, "rainfall", rainfall_rows)
+
     repair_static_file(population_file, "population")
     repair_static_file(idhm_file, "idhm")
 
-    print("Done fixing 2018 weeks 30-37.")
+    print("Done fixing 2018 weeks 30-37 and 2025 weeks 43-52.")
 
 
 if __name__ == "__main__":
